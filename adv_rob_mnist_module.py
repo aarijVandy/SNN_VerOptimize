@@ -30,12 +30,12 @@ def load_mnist() -> tuple[TImageBatch, TLabelBatch, TImageBatch, TLabelBatch]:
     cats = [*range(10)]
 
     # General variables
-    images = []  # To keep training images
-    labels = []  # To keep training labels
-    images_test = []  # To keep test images
-    labels_test = []  # To keep test labels
+    images = []  #   train images  
+    labels = []  #   train labels  
+    images_test = []  #   test images
+    labels_test = []  #   test labels
 
-    # loading MNIST dataset
+
     mndata = MNIST("data/mnist/raw/")
 
     Images, Labels = mndata.load_training()
@@ -73,21 +73,123 @@ def load_mnist() -> tuple[TImageBatch, TLabelBatch, TImageBatch, TLabelBatch]:
 
     return images, labels, images_test, labels_test
 
-def get_samples(num_samples, images, weights_list):
 
-        samples_no_list: list[int] = []
-        sampled_imgs: list[TImage] = []
-        orig_preds: list[int] = []
-        for sample_no in random_sample([*range(len(images))], k= num_samples):
-            info(f"sample {sample_no} is drawn.")
-            samples_no_list.append(sample_no)
-            img: TImage = images[sample_no]
-            sampled_imgs.append(img)  # type: ignore
-            orig_preds.append(forward(weights_list, img))
-        info(f"Sampling is completed with {num_procs} samples.")
 
-        return zip(samples_no_list, sampled_imgs, orig_preds)
 
+
+
+def get_samples(num_samples, images, weights_list): # Extract N random samples from dataset
+
+    samples_no_list: list[int] = []
+    sampled_imgs: list[TImage] = []
+    orig_preds: list[int] = []
+    for sample_no in random_sample([*range(len(images))], k= num_samples):
+        info(f"sample {sample_no} is drawn.")
+        samples_no_list.append(sample_no)
+        img: TImage = images[sample_no]
+        sampled_imgs.append(img)  # type: ignore
+        orig_preds.append(forward(weights_list, img))
+    info(f"Sampling is completed with {num_procs} samples.")
+
+    return zip(samples_no_list, sampled_imgs, orig_preds)
+
+
+def check_sample_marabou(sample: tuple[int,TImage, int], conv, spike_times_map, delta = 1):
+    """
+    TODO: need to explain what conv is
+    returns sat for counter example found. unsat for proven robustness. unk for undecidable
+    """
+
+    # helper
+    def _relu(net: MarabouCore.InputQuery, x: int) -> int:
+        """Return a fresh var y with y = ReLU(x)."""
+        y = net.getNewVariable()
+        net.addRelu(x, y)
+        return y
+
+    sample, img, orig_pred = sample
+    orig_neuron = (orig_pred, 0)
+    
+
+    net = MarabouCore.InputQuery()    # reminder: net is of instance marabou solver, network (locally conv ) 
+                                        # encodes the constraints in marabou terms
+    
+    # encode STL specs
+    for layer in range(len(n_layer_neurons)):
+        for neuron in get_layer_neurons_iter(layer):
+            v = net.getNewVariable()
+            spike_times_map[(neuron, layer)] = v
+    conv.encode_marabou(spike_times_map).transferTo(net)
+
+
+    tx = time.time()
+    # L1 norm check
+    deltas = []
+    input_layer = 0
+    for neuron in get_layer_neurons_iter(layer):
+        s_i = spike_times_map[(in_neuron, input_layer)]
+        eps= int(img[neuron])
+        
+        # d_pos = ReLU(s_i − const), d_neg = ReLU(const − s_i)
+        x_pos  = net.getNewVariable()
+        x_neg  = net.getNewVariable()
+        net.addEquation(Convert_to_Marabou._eq(x_pos, 0.0))   # initialise (will be overridden by ReLU)
+        net.addEquation(Convert_to_Marabou._eq(x_neg, 0.0))
+
+        d_pos = _relu(net, net.addEqualityFromScratch(s_i, eps, 1.0, -1.0))
+        d_neg = _relu(net, net.addEqualityFromScratch(eps, s_i, 1.0, -1.0))
+
+        # Fix the outputs to the ReLU variables
+        net.addEquation(Convert_to_Marabou._eq(x_pos, d_pos))
+        net.addEquation(Convert_to_Marabou._eq(x_neg, d_neg))
+        deltas.extend([d_pos, d_neg])
+
+    lhs = net.getNewVariable()
+    sum_eq = MarabouCore.Equation(MarabouCore.Equation.EQ)
+    sum_eq.addAddend(-1.0, lhs)
+    # Sum all pos & neg deltas from the original input spike times to encode the L1-norm constraint on the input perturbation
+    # ensuring the total change does not exceed delta.
+    for d in deltas:
+        sum_eq.addAddend(1.0, d)
+    sum_eq.setScalar(0.0)
+    net.addEquation(sum_eq)
+    net.addEquation(Convert_to_Marabou._le(lhs, float(delta)))
+    net.setLowerBound(lhs, 0.0)
+    info(f"Input property encoded in time {time.time() - tx} sec")
+
+    tx = time.time()
+    # output property for neruons firing < t_orig_neuron
+    final_layer = len(n_layer_neurons) - 1
+    orig_spike_time = spike_times_map[(orig_neuron, final_layer)]
+
+    disjuncts = []
+    for out_neuron in get_layer_neurons_iter(last_layer):
+        if out_neuron == orig_neuron:
+            continue
+        s_k = spike_times_map[(out_neuron, spike_times_map)]
+        # Case k: s_k ≤ s_orig − 1e-6
+        disjuncts.append([Convert_to_Marabou._le(s_k, -1e-6)])  # will be shifted below
+
+        # Linearise  s_k − s_orig ≤ -1e-6
+        ineq = Convert_to_Marabou._le(s_k, -1e-6)           
+        ineq.addAddend(-1.0, orig_spike_time)         # difference s_k  − orig_spike  ≤ -1e-6
+        disjuncts[-1] = [ineq]
+    
+    net.addDisjuct(disjuncts)
+    info(f"Output property encoded in time {time.time() - tx} sec")
+
+    tx = time.time()
+    vals, stats = net.solve()
+    info(f"Marabou solve-time  {time.time() - tx:6.2f}  sec")
+
+    if vals is not None:
+        info(f"NOT robust for sample {sample_no} (counter-example found)")
+    elif stats["result"] == "unsat":
+        info(f"Robust for sample {sample_no}")
+    else:
+        why = stats.get("result", "unknown")
+        info(f"Unknown for sample {sample_no}  (reason: {why})")
+       
 
 def run_test(cfg: CFG):
     log_name = f"{cfg.log_name}_{num_steps}_{'_'.join(str(l) for l in n_layer_neurons)}_delta{cfg.deltas}.log"
@@ -126,6 +228,9 @@ def run_test(cfg: CFG):
         info("Solver is loaded.")
 
         def check_sample_z3(sample: tuple[int, TImage, int], delta = 1):
+
+            # CHECKS:
+            #       no spike before t_0 , no spiking in layer n for t = t_0 + n * del_t 
             sample_no, img, orig_pred = sample
             orig_neuron = (orig_pred, 0)
             tx = time.time()
@@ -169,7 +274,7 @@ def run_test(cfg: CFG):
 
             tx = time.time()
             S_instance = deepcopy(S)
-            info(f"Network Encoding read in {time.time() - tx} sec")
+            info(f"Network Encoding ready in {time.time() - tx} sec")
             S_instance.add(op)  # type: ignore
             S_instance.add(prop)  # type: ignore
             info(f"Total model ready in {time.time() - tx}")
@@ -221,111 +326,13 @@ def run_test(cfg: CFG):
         # get samples and collect them
         samples = get_samples(cfg.num_samples, images, weights_list)
 
-        # helper
-        def _relu(net: MarabouCore.InputQuery, x: int) -> int:
-            """Return a fresh var y with y = ReLU(x)."""
-            y = net.getNewVariable()
-            net.addRelu(x, y)
-            return y
-            
-            ## check_sampe_marabou was here
-
-
-        def check_sample_marabou(sample: tuple[int,TImage, int], conv, delta = 1):
-            """
-            TODO: need to explain what conv is
-            returns sat for counter example found. unsat for proven robustness. unk for undecidable
-            """
-            sample, img, orig_pred = sample
-            orig_neuron = (orig_pred, 0)
-            
-
-            net = MarabouCore.InputQuery()    # reminder: net is of instance marabou solver, network (locally conv ) 
-                                              # encodes the constraints in marabou terms
-            # encode STL specs
-
-            for layer in range(len(n_layer_neurons)):
-                for neuron in get_layer_neurons_iter(layer):
-                    v = net.getNewVariable()
-                    spike_times_map[(neuron, layer)] = v
-            conv.encode_marabou(spike_times_map).transferTo(net)
         
-
-            tx = time.time()
-            # L1 norm check
-            deltas = []
-            input_layer = 0
-            for neuron in get_layer_neurons_iter(layer):
-                s_i = spike_times_map[(in_neuron, input_layer)]
-                eps= int(img[neuron])
-                
-                # d_pos = ReLU(s_i − const), d_neg = ReLU(const − s_i)
-                x_pos  = net.getNewVariable()
-                x_neg  = net.getNewVariable()
-                net.addEquation(Convert_to_Marabou._eq(x_pos, 0.0))   # initialise (will be overridden by ReLU)
-                net.addEquation(Convert_to_Marabou._eq(x_neg, 0.0))
-
-                d_pos = _relu(net, net.addEqualityFromScratch(s_i, eps, 1.0, -1.0))
-                d_neg = _relu(net, net.addEqualityFromScratch(eps, s_i, 1.0, -1.0))
-
-                # Fix the outputs to the ReLU variables
-                net.addEquation(Convert_to_Marabou._eq(x_pos, d_pos))
-                net.addEquation(Convert_to_Marabou._eq(x_neg, d_neg))
-                deltas.extend([d_pos, d_neg])
-
-            lhs = net.getNewVariable()
-            sum_eq = MarabouCore.Equation(MarabouCore.Equation.EQ)
-            sum_eq.addAddend(-1.0, lhs)
-            # Sum all pos & neg deltas from the original input spike times to encode the L1-norm constraint on the input perturbation
-            # ensuring the total change does not exceed delta.
-            for d in deltas:
-                sum_eq.addAddend(1.0, d)
-            sum_eq.setScalar(0.0)
-            net.addEquation(sum_eq)
-            net.addEquation(Convert_to_Marabou._le(lhs, float(delta)))
-            net.setLowerBound(lhs, 0.0)
-            info(f"Input property encoded in time {time.time() - tx} sec")
-
-            tx = time.time()
-            # output property for neruons firing < t_orig_neuron
-            final_layer = len(n_layer_neurons) - 1
-            orig_spike_time = spike_times_map[(orig_neuron, final_layer)]
-
-            disjuncts = []
-            for out_neuron in get_layer_neurons_iter(last_layer):
-                if out_neuron == orig_neuron:
-                    continue
-                s_k = spike_times_map[(out_neuron, spike_times_map)]
-                # Case k: s_k ≤ s_orig − 1e-6
-                disjuncts.append([Convert_to_Marabou._le(s_k, -1e-6)])  # will be shifted below
-
-                # Linearise  s_k − s_orig ≤ -1e-6
-                ineq = Convert_to_Marabou._le(s_k, -1e-6)           
-                ineq.addAddend(-1.0, orig_spike_time)         # difference s_k  − orig_spike  ≤ -1e-6
-                disjuncts[-1] = [ineq]
-            
-            net.addDisjuct(disjuncts)
-            info(f"Output property encoded in time {time.time() - tx} sec")
-
-            tx = time.time()
-            vals, stats = net.solve()
-            info(f"Marabou solve-time  {time.time() - tx:6.2f}  sec")
-
-            if vals is not None:
-                info(f"NOT robust for sample {sample_no} (counter-example found)")
-            elif stats["result"] == "unsat":
-                info(f"Robust for sample {sample_no}")
-            else:
-                why = stats.get("result", "unknown")
-                info(f"Unknown for sample {sample_no}  (reason: {why})")
-       
-
         for delta in cfg.deltas:
             
             samples = get_samples(cfg.num_samples, images, weights_list)
             if mp:
                 with Pool(num_procs) as pool:
-                    pool.map(partial(check_sample_marabou, conv = conv , delta = delta),  samples)
+                    pool.map(partial(check_sample_marabou, conv = S , delta = delta),  samples)
                     pool.close()
                     pool.join()
             else:
@@ -336,7 +343,7 @@ def run_test(cfg: CFG):
         # Recursively find available adversarial attacks.
         def search_perts(
             img: TImage, delta: int, loc: int = 0, pert: TImage | None = None
-        ) -> Generator[TImage, None, None]:
+        ) -> Generator[TImage, None, None]:             # generator to yield when example found for lazy eval
             # Initial case
             if pert is None: 
                 pert = np.zeros_like(img, dtype=img.dtype)
@@ -451,3 +458,6 @@ def run_test(cfg: CFG):
 
 
 # %%
+if __name__ == "__main__":
+    cfg = parse_args()
+    run_test(cfg)
