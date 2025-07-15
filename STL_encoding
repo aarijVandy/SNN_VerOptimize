@@ -1,0 +1,249 @@
+from tqdm.auto import tqdm
+from utils.debug import info
+import utils.encoding_mnist as enc
+from maraboupy import Marabou, MarabouCore
+from utils.dictionary_mnist import *
+
+
+class Convert_to_Marabou:
+   
+    def __init__(self,model, potential_threshold=0.01):
+        self.input_neurons  = model.input_neurons
+        self.output_neurons = model.output_neurons
+        self.weights        = model.weights
+        self.threshold      = potential_threshold
+        self.num_steps      = 3
+        self._w_abs_max     = max(abs(w) for w in self.weights.values())
+    
+    
+    def encode_marabou(self, spike_times_map):
+
+        num_steps = self.num_steps
+        assert num_steps - 1 >= len(n_layer_neurons) - 1, "num_steps too small to encode layer-based lower bounds"
+        network = MarabouCore.InputQuery()
+
+        #─── 1) compute an upper bound on how many vars you'll need ───
+        # number of spike-time vars
+        num_spike = sum(n_layer_neurons)
+        # each spike-time spawns num_steps boolean indicators
+        num_spiked_by = num_spike * num_steps
+        # prefix potentials only for layers ≥1, each for (num_steps - layer) times
+        num_prefix_pot = sum(n_layer_neurons[l] * (num_steps - l)
+                             for l in range(1, len(n_layer_neurons)))
+        # selectors likewise
+        num_selectors = num_prefix_pot
+
+    
+        total_vars = (num_spike+
+                         num_spiked_by+
+                         num_prefix_pot+
+                         num_selectors+
+                         num_spike)
+        network.setNumberOfVariables(total_vars)
+    
+        
+        next_var = 0
+        def new_var():
+            nonlocal next_var
+            v = next_var
+            next_var += 1
+            return v
+    
+        #─── allocate spike-time vars ─────────────────────
+
+        for layer in range(len(n_layer_neurons)):
+            for neuron in enc.get_layer_neurons_iter(layer):
+                v = new_var()
+                spike_times_map[(neuron, layer)] = v
+
+
+        num_steps = self.num_steps
+
+        ## ensure all spike times  0 <= t <= num_steps - 1
+        for layer in range(len(n_layer_neurons)):  
+
+            for neuron in (tqdm(enc.get_layer_neurons_iter(layer))):
+                s = spike_times_map[(neuron, layer)]
+                network.setLowerBound(s, 0)
+                network.setUpperBound(s, float(num_steps - 1))
+                # network.addDisjunctionConstraint(network, [[self._eq(s, 0.0)], [self._eq(s, 1.0)]])
+
+                
+                # # spike_time >= layer --> s_i - layer >= 0
+                # req_1_equations_lb = MarabouCore.Equation(MarabouCore.Equation.GE)
+                # req_1_equations_lb.addAddend(1, spike_times_map[neuron, layer])
+                # req_1_equations_lb.setScalar(float(layer))
+                # # spike_time <= num_Steps - 1
+                # req_1_equations_ub = MarabouCore.EquationArray(MarabouCore.Equation.LE)
+                # req_1_equations_ub.addAddend(1, spike_times_map[neuron, layer])
+                # req_1_equations_ub.setScalar(float(num_steps - 1))
+                
+                # network.addEquation(req_1_equations_lb)
+                # network.addEquation(req_1_equations_ub)
+
+        ## ensure each neuron spikes when total voltage > threshold
+
+        spiked_by: Dict[Tuple[Neuron, int, int], int] = {}
+        for layer in range(len(n_layer_neurons)):
+            for j in enc.get_layer_neurons_iter(layer):
+                s_j = spike_times_map[(j, layer)]
+
+                for t in range(layer, num_steps):
+                    ind = new_var()
+                    spiked_by[(j, layer, t)] = ind
+
+                    # Boolean 0/1 indicator
+                    network.setLowerBound(ind, 0.0)
+                    network.setUpperBound(ind, 1.0)
+                    eq0 = MarabouCore.Equation(MarabouCore.Equation.EQ)
+                    eq0.addAddend(1.0, ind)
+                    eq0.setScalar(0.0)
+                    eq1 = MarabouCore.Equation(MarabouCore.Equation.EQ)
+                    eq1.addAddend(1.0, ind)
+                    eq1.setScalar(1.0)
+                    
+                    # network.addDisjunction([[eq0], [eq1]])
+
+                    # Link to spike-time:
+                    #   (s_j ≤ t-1  ⇔  ind = 1)
+                    #   (s_j ≥ t    ⇔  ind = 0)
+                    cA = [  # spiked
+                        self._le(s_j, t - 1),
+                        self._eq(ind, 1.0),
+                    ]
+                    cB = [  # not yet spiked
+                        self._ge(s_j, float(t)),
+                        self._eq(ind, 0.0),
+                    ]
+                    MarabouCore.addDisjunctionConstraint(network, [cA, cB])
+
+        # ------------------------------------------------------------------ #
+        # 3.  Prefix-potential variables  prefix_pot[(j_out, ℓ, t)]
+        # ------------------------------------------------------------------ #
+        prefix_pot: Dict[Tuple[int, int, int], int] = {}
+        for out_layer in range(1, len(n_layer_neurons)):
+            in_layer = out_layer - 1
+            fan_in   = n_layer_neurons[in_layer]
+
+            for j_out in range(n_layer_neurons[out_layer]):
+                for t in range(out_layer, num_steps):
+                    pot = new_var()
+                    prefix_pot[(j_out, out_layer, t)] = pot
+
+                    # Bounds help Marabou tighten:
+                    ub = fan_in * self._w_abs_max
+                    # network.setLowerBound(pot, 0.0)
+                    network.setUpperBound(pot, ub)
+
+                    eq = MarabouCore.Equation(MarabouCore.Equation.EQ)
+                    eq.addAddend(-1.0, pot)
+
+                    for j_in in enc.get_layer_neurons_iter(in_layer):
+                        w = self.weights[(j_in, j_out, in_layer)]
+                        ind = spiked_by[(j_in, in_layer, t)]
+                        eq.addAddend(w, ind)
+
+                    eq.setScalar(0.0)
+                    network.addEquation(eq)
+
+                    #sample 1952 is drawn.
+                    # sample 6140 is drawn.
+                    # sample 14328 is drawn.
+                    # sample 15247 is drawn.
+                    # sample 33118 is drawn.
+                    # sample 39453 is drawn.
+                    # sample 1739 is drawn.
+
+        # ------------------------------------------------------------------ #
+        # 4.  "First spike" – exactly-one-time encoding per output neuron
+        # ------------------------------------------------------------------ #
+        for out_layer in range(1, len(n_layer_neurons)):
+            for j_out in range(n_layer_neurons[out_layer]):
+                s_out = spike_times_map[( (j_out, 0), out_layer )]  # neuron tuple = (idx, 0)
+
+                # One selector per candidate spike time
+                selectors = []
+
+                disjuncts = []
+                for t in range(out_layer, num_steps - 1):
+                    sel = new_var()
+                    selectors.append(sel)
+                    network.setLowerBound(sel, 0.0)
+                    network.setUpperBound(sel, 1.0)
+                    MarabouCore.addDisjunctionConstraint(network, [[self._eq(sel, 0.0)], [self._eq(sel, 1.0)]])
+
+                    eq_time = self._eq(s_out, float(t))
+                    prev_lt = self._le(prefix_pot[(j_out, out_layer, t)], self.threshold - 1e-6)
+                    curr_ge = self._ge(prefix_pot[(j_out, out_layer, t + 1)], self.threshold)
+                    sel_is1 = self._eq(sel, 1.0)
+
+                    disjuncts.append([eq_time, prev_lt, curr_ge, sel_is1])
+
+                # Fall-back case t = num_steps-1
+                sel_final = new_var()
+                selectors.append(sel_final)
+                network.setLowerBound(sel_final, 0.0)
+                network.setUpperBound(sel_final, 1.0)
+                MarabouCore.addDisjunctionConstraint(network,[[self._eq(sel_final, 0.0)], [self._eq(sel_final, 1.0)]])
+
+                eq_last  = self._eq(s_out, float(num_steps - 1))
+                prev_lt  = self._le(prefix_pot[(j_out, out_layer, num_steps - 1)], self.threshold - 1e-6)
+                sel1     = self._eq(sel_final, 1.0)
+                disjuncts.append([eq_last, prev_lt, sel1])
+
+                # At least ONE of the cases
+                MarabouCore.addDisjunctionConstraint(network, disjuncts)
+
+                # … and the selectors force **exactly one**
+                sum_eq = MarabouCore.Equation(MarabouCore.Equation.EQ)
+                for sel in selectors:
+                    sum_eq.addAddend(1.0, sel)
+                sum_eq.setScalar(1.0)
+                network.addEquation(sum_eq)
+
+        return network
+   
+    @staticmethod
+    def _eq(var: int, c: float) -> MarabouCore.Equation:
+        e = MarabouCore.Equation(MarabouCore.Equation.EQ)
+        e.addAddend(1.0, var)
+        e.setScalar(c)
+        return e
+
+    @staticmethod
+    def _le(var: int, c: float) -> MarabouCore.Equation:
+        e = MarabouCore.Equation(MarabouCore.Equation.LE)
+        e.addAddend(1.0, var)
+        e.setScalar(c)
+        return e
+
+    @staticmethod
+    def _ge(var: int, c: float) -> MarabouCore.Equation:
+        e = MarabouCore.Equation(MarabouCore.Equation.GE)
+        e.addAddend(1.0, var)
+        e.setScalar(c)
+        return e
+        
+        
+        ### CHAT CODE ENDS
+        """
+        spiked_by = {} # dictionary to store pre-potentials
+        for layer in range(len(n_layer_neurons)):
+            for in_neuron in get_layer_neurons_iter(layer):
+                s_var = spike_times_map[in_neuron, layer]
+                # Note: we only really need t from layer..num_steps-1, but this covers all
+                for t in range(layer, num_steps):
+                    # True if spike_times[in_neuron,layer] ≤ t–1
+                    spiked_by[(in_neuron, layer, t)] = (s_var <= (t - 1))
+
+        for i, layer_neurons in range(n_layer_neurons):
+            in_layer = i - 1
+            for out_neuron_pos in range(layer_neurons):
+                curr_potential = 0
+                for t in range(i, nums_time_steps - 1):
+
+                if spike_times_map[neuron, layer] <= time_steps - 1:
+                    sum+= weights[in_neuron, out_neuron_pos, in_layer]
+
+
+        """
